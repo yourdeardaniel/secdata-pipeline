@@ -1,0 +1,31 @@
+# secdata-pipeline configuration
+
+api:
+  # Where the LLM server is listening (vLLM, Ollama, or compatible API)
+  model_base_url: "http://localhost:8000/v1"
+  model_api_key:  "none"  # not required for local servers
+
+  # The model to use for conversion. The pipeline is tuned for Qwen 2.5 72B,
+  # but any reasonably capable instruction-tuned model will work.
+  model_name:     "Qwen/Qwen2.5-72B-Instruct-AWQ"
+
+processing:
+  converter:
+    max_input_chars:    3000
+    max_tokens_output:  1500
+    delay_seconds:      0.1
+    batch_size:         250
+
+  filter:
+    min_quality_score: 7    # 1–10, higher = stricter
+    batch_size:        500
+
+  deduplicator:
+    similarity_threshold: 0.92  # cosine sim above this counts as duplicate
+    embedding_model:      "all-MiniLM-L6-v2"
+
+output:
+  raw_dir:         "./data/raw"
+  processed_dir:   "./data/processed"
+  final_file:      "./data/final_dataset.jsonl"
+  checkpoint_file: "./data/checkpoint.json"
