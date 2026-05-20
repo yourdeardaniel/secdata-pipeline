@@ -16,6 +16,10 @@ from openai import OpenAI
 from tqdm import tqdm
 from utils import load_jsonl, append_jsonl, load_checkpoint, save_checkpoint, count_lines
 
+# Layer 2 of the three-layer safety architecture (see SAFETY.md).
+# Runs on every converted example before it enters the processed file.
+from processing.safety_validator import validate_example as _safety_validate
+
 
 def stable_doc_id(doc):
     return (doc.get("url") or doc.get("id") or doc.get("file", "") or
@@ -49,6 +53,61 @@ The goal is a model that is deeply knowledgeable and genuinely useful
 to security professionals, researchers, and students — while being
 resistant to misuse by people seeking to attack systems they do not
 own or have permission to test.
+
+═══════════════════════════════════════════════════════════════
+HARD REFUSAL CATEGORIES — ALWAYS SKIP
+═══════════════════════════════════════════════════════════════
+
+These categories always return {"skip": true} regardless of how
+the source content is framed. No educational, research, or CTF
+context redeems them. When in doubt, skip.
+
+  SEXUAL CONTENT INVOLVING MINORS
+    Any source that sexualizes minors, describes grooming of minors,
+    or contains content that could be used to identify or target
+    minors for abuse. Return {"skip": true} immediately. Do not
+    attempt to "clean up" or reframe such content.
+
+  WEAPONS OF MASS DESTRUCTION
+    Synthesis routes for chemical weapons (sarin, VX, mustard gas,
+    novichok). Enrichment procedures for nuclear materials. Weaponization
+    of biological agents (anthrax, smallpox, ricin, botulinum). Specific
+    construction details for radiological dispersal devices. Academic
+    papers describing detection or defense against such weapons are
+    fine; synthesis or weaponization procedures are not.
+
+  OPERATIONAL EXTORTION TEMPLATES
+    Ransomware notes ready to deploy ("Your files have been encrypted,
+    send X bitcoin to..."), extortion script templates with payment
+    demands, doxxing-as-leverage messaging. Analysis of how ransomware
+    works is fine; ready-to-use operational templates are not.
+
+  TARGETED PERSONAL INFORMATION GATHERING
+    Instructions framed around finding a specific real person's home
+    address, phone number, family members, or daily routine. Stalking
+    or surveillance methodology aimed at named individuals. OSINT
+    techniques in general are fine when framed for investigation,
+    journalism, or defense; instructions for stalking individuals
+    are not.
+
+  CRITICAL INFRASTRUCTURE ATTACK INSTRUCTIONS
+    Step-by-step procedures for attacking power grids, water treatment,
+    hospitals, medical devices, traffic control, nuclear facilities,
+    or other life-safety systems. Vulnerability analysis and defensive
+    research on these systems is fine; operational attack procedures
+    against them are not.
+
+═══════════════════════════════════════════════════════════════
+WHEN IN DOUBT, SKIP
+═══════════════════════════════════════════════════════════════
+
+A skipped example costs one training pair. An unsafe example costs
+trust. If a piece of source content sits in a gray area where you
+are unsure whether the educational framing is genuine or whether it
+reads as operational attack content, return {"skip": true}.
+
+The dataset has 4 million source documents. Losing some to caution
+is fine. Letting through content that shouldn't be there is not.
 
 ═══════════════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -411,6 +470,8 @@ def run(cfg, raw_file, processed_file, checkpoint_file):
     batch_size = conv_cfg.get("batch_size", 250)
     batch      = []
     failed     = 0
+    safety_rejected: dict = {}   # reason -> count, Layer 2 rejections
+    safety_flags: dict    = {}   # flag category -> count, Tier 3 flags
 
     for doc in tqdm(remaining, desc="Converting", unit="doc"):
         doc_id = stable_doc_id(doc)
@@ -439,14 +500,28 @@ def run(cfg, raw_file, processed_file, checkpoint_file):
             if (isinstance(instr, str) and isinstance(inp, str)
                     and isinstance(output, str)
                     and len(instr) > 10 and len(output) > 30):
-                batch.append({
+
+                example = {
                     "instruction": instr,
                     "input":       inp,
                     "output":      output,
                     "source_url":  doc.get("url", ""),
                     "source_type": doc.get("source", ""),
-                })
-                done_ids.add(doc_id)
+                }
+
+                # Layer 2 safety validation — runs on every converted example
+                # before it enters the processed file. See SAFETY.md.
+                keep, reason, flags = _safety_validate(example)
+                if not keep:
+                    safety_rejected[reason] = safety_rejected.get(reason, 0) + 1
+                    done_ids.add(doc_id)
+                else:
+                    if flags:
+                        example["_safety_flags"] = flags
+                        for flag in flags:
+                            safety_flags[flag] = safety_flags.get(flag, 0) + 1
+                    batch.append(example)
+                    done_ids.add(doc_id)
             else:
                 failed += 1
                 done_ids.add(doc_id)
@@ -481,8 +556,19 @@ def run(cfg, raw_file, processed_file, checkpoint_file):
 
     if failed:
         print(f"[converter] {failed} documents skipped (bad output).")
-    print(f"[converter] Done. Total: {count_lines(processed_file):,}")
 
-# ── Post-conversion safety validation ────────────────────────────
-# Imported here so it runs after conversion but before writing.
-from processing.safety_validator import validate_example as _validate
+    # Layer 2 safety validation summary
+    total_safety_rejected = sum(safety_rejected.values())
+    total_safety_flagged  = sum(safety_flags.values())
+    if total_safety_rejected or total_safety_flagged:
+        print(f"\n[converter] === Layer 2 safety validation summary ===")
+        if total_safety_rejected:
+            print(f"[converter] Rejected by safety validator: {total_safety_rejected:,}")
+            for reason, n in sorted(safety_rejected.items(), key=lambda x: -x[1]):
+                print(f"[converter]   {n:>6,}  {reason}")
+        if total_safety_flagged:
+            print(f"[converter] Tier 3 flags (kept but flagged): {total_safety_flagged:,}")
+            for flag, n in sorted(safety_flags.items(), key=lambda x: -x[1]):
+                print(f"[converter]   {n:>6,}  {flag}")
+
+    print(f"[converter] Done. Total: {count_lines(processed_file):,}")
